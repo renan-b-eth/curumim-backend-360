@@ -24,6 +24,8 @@ from fastapi import FastAPI, Request, Response, Form, HTTPException
 import uvicorn
 import httpx
 
+# --- Configuração FastAPI para Webhook da Meta ---
+api_app = FastAPI()
 
 # --- Configurar Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -647,8 +649,7 @@ def get_completion_message(user_state: dict) -> str:
     )
 
 
-# --- Configuração FastAPI para Webhook da Meta ---
-api_app = FastAPI()
+
 
 @api_app.get("/")
 async def root():
@@ -764,4 +765,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     logger.info(f"Iniciando servidor FastAPI na porta {port}...")
     # host="0.0.0.0" permite que o servidor seja acessível externamente (necessário para ngrok/deploy)
-    uvicorn.run(api_app, host="0.0.0.0", port=port)
+    #uvicorn.run(api_app, host="0.0.0.0", port=port)
