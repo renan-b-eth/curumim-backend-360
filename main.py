@@ -7,11 +7,13 @@ import io
 import tempfile
 import json
 import asyncio
+import time # Para simular atrasos quando necessário
 
 # --- Imports para ASR (Whisper) ---
 from transformers import pipeline
 import torch
 import soundfile as sf # Útil para garantir que o áudio está no formato certo para o Whisper
+import numpy as np # Para manipulação de arrays de áudio, se necessário
 
 # --- Imports para Google Cloud TTS ---
 from google.cloud import texttospeech
@@ -147,6 +149,26 @@ def upload_audio_to_r2(file_path: str, bucket_key: str, content_type: str) -> st
         logger.error(f"Erro ao fazer upload do arquivo '{file_path}' para R2 como '{bucket_key}': {e}")
         return None
 
+def upload_audio_bytes_to_r2(audio_bytes: bytes, bucket_key: str, content_type: str) -> str | None:
+    """Faz o upload de bytes de áudio para o Cloudflare R2."""
+    if not s3_client or not R2_ENDPOINT_URL_PUBLIC:
+        logger.error("S3 client (R2) ou URL pública não estão configurados. Não é possível fazer upload de áudio.")
+        return None
+        
+    try:
+        s3_client.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=bucket_key,
+            Body=audio_bytes,
+            ContentType=content_type
+        )
+        public_url = f"{R2_ENDPOINT_URL_PUBLIC}/{bucket_key}"
+        logger.info(f"Áudio (bytes) '{bucket_key}' carregado para R2. URL pública: {public_url}")
+        return public_url
+    except Exception as e:
+        logger.error(f"Erro ao fazer upload de bytes de áudio para R2 como '{bucket_key}': {e}")
+        return None
+
 # --- Funções de Voz (ASR e TTS) ---
 
 async def transcribe_audio(audio_data_bytes: bytes, file_format: str = "ogg") -> str | None:
@@ -160,8 +182,6 @@ async def transcribe_audio(audio_data_bytes: bytes, file_format: str = "ogg") ->
             temp_audio_file.write(audio_data_bytes)
             temp_audio_file_path = temp_audio_file.name
             
-        # O Whisper pode aceitar vários formatos, mas se tiver problemas, soundfile pode ajudar a normalizar.
-        # Aqui, estamos passando o caminho do arquivo diretamente, que o pipeline deve conseguir lidar.
         # Para pt-BR, é melhor usar o generate_kwargs={"language": "portuguese"}
         transcript_result = asr_pipeline(temp_audio_file_path, chunk_length_s=30, return_timestamps="word", generate_kwargs={"language": "portuguese"})
         transcript = transcript_result["text"]
@@ -217,6 +237,12 @@ async def init_user_state(user_id: str, username: str) -> dict:
             "user_id": user_id, 
             "platform": "whatsapp", 
             "username": username,
+            "name": None,
+            "age": None,
+            "diagnosis": None,
+            "smoking_status": None,
+            "emotional_state": None,
+            "environment": None,
             "current_audio_task": None, # Qual tarefa de áudio está sendo solicitada no momento
             "audio_urls": {} # Para armazenar URLs dos áudios de cada tarefa específica
         },
@@ -227,8 +253,11 @@ async def init_user_state(user_id: str, username: str) -> dict:
     return user_states[state_key]
 
 # --- Funções de Resposta para WhatsApp Business Cloud API (Meta) ---
-async def send_whatsapp_response(to_number: str, user_state: dict, text: str) -> None:
+async def send_whatsapp_response(to_number: str, user_state: dict, text: str, delay: int = 0) -> None:
     """Envia uma resposta via WhatsApp Business Cloud API da Meta."""
+    if delay > 0:
+        await asyncio.sleep(delay) # Adiciona um atraso antes de enviar a mensagem
+
     if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
         logger.error("Credenciais da WhatsApp Business Cloud API incompletas. Não é possível enviar mensagens.")
         return
@@ -253,15 +282,11 @@ async def send_whatsapp_response(to_number: str, user_state: dict, text: str) ->
             audio_response_bytes = await generate_speech_from_text(text)
             if audio_response_bytes:
                 audio_filename = f"whatsapp_tts_{uuid.uuid4().hex}.ogg"
-                temp_audio_file_path = os.path.join(tempfile.gettempdir(), audio_filename)
-                
-                with open(temp_audio_file_path, "wb") as f:
-                    f.write(audio_response_bytes)
                 
                 # Chave para o R2: Ex: whatsapp_audios/tts/5511987654321/tts_xyz.ogg
                 # Adicione uma subpasta para TTS dentro do diretório do usuário
                 r2_key = f"whatsapp_audios/{to_number}/tts/{audio_filename}"
-                public_audio_url = upload_audio_to_r2(temp_audio_file_path, r2_key, "audio/ogg")
+                public_audio_url = upload_audio_bytes_to_r2(audio_response_bytes, r2_key, "audio/ogg")
 
                 if public_audio_url:
                     payload = {
@@ -275,7 +300,6 @@ async def send_whatsapp_response(to_number: str, user_state: dict, text: str) ->
                 else:
                     logger.error("Não foi possível obter URL pública para áudio do R2. Enviando como texto.")
                 
-                os.remove(temp_audio_file_path) # Limpa o arquivo temporário
         except Exception as e:
             logger.error(f"Falha ao gerar e enviar resposta em voz para WhatsApp via Meta API, retornando para texto: {e}")
             # Se falhou, o payload original de texto já está pronto e será usado
@@ -291,7 +315,7 @@ async def send_whatsapp_response(to_number: str, user_state: dict, text: str) ->
             logger.error(f"Erro ao enviar mensagem WhatsApp (Meta API) para {to_number}: {e}")
 
 # --- Lógica de Manipulação de Mensagens Principal ---
-async def process_whatsapp_message(user_id: str, username: str, user_input_text: str = None, user_audio_media_id: str = None) -> (str, dict):
+async def process_whatsapp_message(user_id: str, username: str, user_input_text: str = None, user_audio_media_id: str = None, raw_message_payload: str = None) -> (str, dict):
     """
     Processa uma mensagem de entrada do usuário do WhatsApp (texto ou áudio)
     e retorna a resposta em texto e o estado atualizado.
@@ -300,7 +324,7 @@ async def process_whatsapp_message(user_id: str, username: str, user_input_text:
     
     # Se não tem estado ou /start, inicializa/reseta
     if state_key not in user_states or (user_input_text and user_input_text.lower() == "/start"):
-        user_states[state_key] = await init_user_id(user_id, username)
+        user_states[state_key] = await init_user_state(user_id, username)
         # O estado inicial "initial" levará à pergunta de modo de interação
         return "Olá! Bem-vindo ao Kurumim. Como você gostaria de interagir? Por *texto* ou por *voz*?", user_states[state_key]
 
@@ -338,60 +362,39 @@ async def process_whatsapp_message(user_id: str, username: str, user_input_text:
                 audio_data_bytes = download_file_response.content
             
             # 3. Determinar o formato do arquivo para o Whisper
-            # WhatsApp geralmente envia OGG (opus), mas é bom ter flexibilidade.
             file_format = content_type.split('/')[-1] if '/' in content_type else "ogg"
-            # O Whisper pode ser sensível ao formato. Se for OGG, o SoundFile ajuda a ler.
-            if file_format == "ogg":
-                with io.BytesIO(audio_data_bytes) as audio_buffer:
-                    audio_array, samplerate = sf.read(audio_buffer)
-                
-                # Se Whisper esperar um caminho de arquivo, ainda precisaremos salvar temporariamente.
-                # Para evitar re-escrita, vamos salvar um arquivo temporário em formato .wav que é universal
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav_file:
-                    sf.write(temp_wav_file.name, audio_array, samplerate)
-                    temp_audio_file_path_for_whisper = temp_wav_file.name
+            
+            # 4. Transcrever o áudio (apenas se não for a tarefa de 'silence')
+            if user_state["metadata"]["current_audio_task"] != "silence":
+                processed_text = await transcribe_audio(audio_data_bytes, file_format=file_format)
+                if not processed_text:
+                    return "Desculpe, não consegui entender o que você disse. Poderia repetir?", user_state
+                logger.info(f"[whatsapp:{user_id}] Áudio transcrito para: '{processed_text}'")
             else:
-                # Para outros formatos, ou se não quisermos processar com soundfile, salvamos como recebido.
-                with tempfile.NamedTemporaryFile(suffix=f".{file_format}", delete=False) as temp_raw_audio_file:
-                    temp_raw_audio_file.write(audio_data_bytes)
-                    temp_audio_file_path_for_whisper = temp_raw_audio_file.name
+                processed_text = "[Áudio de silêncio]" # Não transcrever silêncio
 
-            # 4. Transcrever o áudio
-            processed_text = await transcribe_audio(audio_data_bytes, file_format=file_format) # O transcribe_audio já salva e limpa.
-
-            if not processed_text:
-                return "Desculpe, não consegui entender o que você disse. Poderia repetir?", user_state
-            logger.info(f"[whatsapp:{user_id}] Áudio transcrito para: '{processed_text}'")
-
-            # 5. Salvar áudio original no R2 (se configurado e necessário)
-            # Vamos garantir que salvamos o áudio ORIGINAL recebido da Meta no R2,
-            # mesmo que a transcrição use um formato intermediário.
+            # 5. Salvar áudio original no R2
             if s3_client and R2_ENDPOINT_URL_PUBLIC:
-                original_audio_filename = f"original_{user_audio_media_id}.{file_format}"
-                r2_key_original = f"whatsapp_audios/{user_id}/received/{original_audio_filename}"
+                # Usar o ID da mensagem para o nome do arquivo para garantir unicidade
+                original_audio_filename = f"{message.get('id', uuid.uuid4().hex)}.{file_format}"
                 
-                # Salvar os bytes originais diretamente para o R2, sem tempfile aqui
-                s3_client.put_object(
-                    Bucket=R2_BUCKET_NAME,
-                    Key=r2_key_original,
-                    Body=audio_data_bytes,
-                    ContentType=content_type
-                )
-                public_original_audio_url = f"{R2_ENDPOINT_URL_PUBLIC}/{r2_key_original}"
+                # Categoria de áudio (e.g., "received_message", "task_silence", "task_vogal_a")
+                audio_category = "received_message"
+                if user_state["metadata"]["current_audio_task"]:
+                    audio_category = f"task_{user_state['metadata']['current_audio_task']}"
+
+                r2_key_original = f"whatsapp_audios/{user_id}/{audio_category}/{original_audio_filename}"
                 
+                public_original_audio_url = upload_audio_bytes_to_r2(audio_data_bytes, r2_key_original, content_type)
+
                 if public_original_audio_url:
                     logger.info(f"[whatsapp:{user_id}] Áudio original salvo no R2: {public_original_audio_url}")
-                    # Você pode armazenar essa URL no estado do usuário se precisar
-                    # Por exemplo, se for um áudio de tarefa, armazenar com o nome da tarefa
+                    # Armazenar a URL no estado do usuário sob a tarefa atual
                     if user_state["metadata"]["current_audio_task"]:
                         task_name = user_state["metadata"]["current_audio_task"]
                         user_state["metadata"]["audio_urls"][task_name] = public_original_audio_url
                 else:
                     logger.warning(f"[whatsapp:{user_id}] Falha ao obter URL pública para áudio original Media ID: {user_audio_media_id}")
-
-            # Limpar o arquivo temporário usado pelo Whisper se ele foi criado
-            if 'temp_audio_file_path_for_whisper' in locals() and os.path.exists(temp_audio_file_path_for_whisper):
-                os.remove(temp_audio_file_path_for_whisper)
         
         except httpx.HTTPStatusError as e:
             logger.error(f"[whatsapp:{user_id}] Erro HTTP ao baixar mídia da Meta API: {e.response.status_code} - {e.response.text}")
@@ -403,8 +406,10 @@ async def process_whatsapp_message(user_id: str, username: str, user_input_text:
     elif interaction_mode == "voice" and not user_audio_media_id and user_input_text:
         # Modo voz mas recebeu texto - tratar como texto
         response_text = "Detectei que você está no modo de *voz*, mas enviou uma mensagem de *texto*. Processando sua mensagem de texto."
-        if processed_text:
-            response_text += f"\nSua mensagem: '{processed_text}'"
+        # Se for um estágio de áudio, informar que esperava áudio
+        if current_stage.startswith("awaiting_audio_"):
+            task_type = user_state["metadata"]["current_audio_task"]
+            response_text += f"\nMas esperava um *áudio* para a tarefa '{task_type.replace('_',' ')}'. Você gostaria de tentar novamente enviando um áudio?"
         return response_text, user_state
     
     elif interaction_mode == "text" and user_audio_media_id:
@@ -524,8 +529,8 @@ async def process_whatsapp_message(user_id: str, username: str, user_input_text:
     elif current_stage == "awaiting_environment":
         if processed_text:
             user_state["metadata"]["environment"] = processed_text
-            # Definindo a fila de tarefas de áudio
-            user_state["tasks_queue"] = ["vogal_a", "vogal_i", "vogal_o", "contagem_1_10"]
+            # Definindo a fila de tarefas de áudio com as novas tarefas
+            user_state["tasks_queue"] = ["silence", "vogal_a", "vogal_e", "vogal_i", "vogal_o", "fricativo_s", "fricativo_z", "sentence_read"]
             response_text = (
                 "Perfeito! Seus dados iniciais foram registrados. Agora, vamos para a parte mais importante: a sua voz. "
                 "Por favor, encontre um local o mais silencioso possível. "
@@ -543,7 +548,7 @@ async def process_whatsapp_message(user_id: str, username: str, user_input_text:
             # O processamento e upload do áudio para o R2 já ocorreu no início de process_whatsapp_message
             # e a URL do áudio da tarefa já foi salva em user_state["metadata"]["audio_urls"]
             task_type = user_state["metadata"]["current_audio_task"]
-            response_text = f"Áudio da {task_type.replace('_',' ')} recebido e salvo! Obrigado."
+            response_text = f"Áudio da tarefa '{task_type.replace('_',' ')}' recebido e salvo! Obrigado."
             
             # Se há mais tarefas na fila, pede a próxima
             if user_state["tasks_queue"]:
@@ -597,14 +602,24 @@ async def process_whatsapp_message(user_id: str, username: str, user_input_text:
 
 def get_task_prompt(task_type: str) -> str:
     """Retorna o texto da instrução para cada tarefa de áudio."""
-    if task_type == "vogal_a":
-        return "Ótimo! Inspire fundo. Quando estiver pronto, por favor, diga 'Aaaaaa' por cerca de 5 segundos e envie o áudio."
+    if task_type == "silence":
+        return "Para a primeira gravação, por favor, inspire fundo e grave cerca de 5 segundos de *silêncio* no ambiente onde você está. Isso nos ajuda a analisar o ruído de fundo. Pode começar quando estiver pronto!"
+    elif task_type == "vogal_a":
+        return "Ótimo! Inspire fundo. Quando estiver pronto, por favor, diga 'Aaaaaa' por cerca de 5 segundos em um tom normal e envie o áudio."
+    elif task_type == "vogal_e":
+        return "Excelente. Agora, vamos fazer o mesmo com a vogal 'E'. Inspire fundo. Quando estiver pronto, por favor, diga 'Eeeee' por cerca de 5 segundos em um tom normal e envie o áudio."
     elif task_type == "vogal_i":
-        return "Excelente. Agora, vamos fazer o mesmo com a vogal 'I'. Inspire fundo. Quando estiver pronto, por favor, diga 'Iiiiiii' por cerca de 5 segundos e envie o áudio."
+        return "Perfeito! Para a próxima, inspire fundo. Quando estiver pronto, por favor, diga 'Iiiiiii' por cerca de 5 segundos em um tom normal e envie o áudio."
     elif task_type == "vogal_o":
-        return "Quase lá! Para a última vogal, inspire fundo. Quando estiver pronto, por favor, diga 'Oooooo' por cerca de 5 segundos e envie o áudio."
-    elif task_type == "contagem_1_10":
-        return "Para a próxima tarefa, por favor, inspire fundo. Quando estiver pronto, conte pausadamente de 1 a 10 e envie o áudio."
+        return "Quase lá! Para a vogal 'O', inspire fundo. Quando estiver pronto, por favor, diga 'Oooooo' por cerca de 5 segundos em um tom normal e envie o áudio."
+    elif task_type == "fricativo_s":
+        return "Muito bem! Agora, faremos um som diferente. Inspire fundo e, quando estiver pronto, emita o som de 'Sssssss' de forma contínua pelo máximo de tempo que conseguir, e envie o áudio."
+    elif task_type == "fricativo_z":
+        return "Perfeito. Agora, faremos o mesmo com o som de 'Z'. Inspire fundo e, quando estiver pronto, emita o som de 'Zzzzzzz' de forma contínua pelo máximo de tempo que conseguir, e envie o áudio."
+    elif task_type == "sentence_read":
+        # Exemplo de frase foneticamente balanceada em português (pode ser ajustada)
+        sentence = "O peito do pé do Pedro é preto. A aranha arranha a jarra."
+        return f"Para a última tarefa, por favor, inspire fundo e leia a seguinte frase em voz alta de forma natural: \"{sentence}\". Envie o áudio quando terminar."
     return "Tarefa de áudio desconhecida. Por favor, tente novamente."
 
 def get_completion_message(user_state: dict) -> str:
@@ -624,8 +639,9 @@ def get_completion_message(user_state: dict) -> str:
         f"\nNome/ID: {collected_data.get('name', 'N/A')}"
         f"\nIdade: {collected_data.get('age', 'N/A')}"
         f"\nDiagnóstico: {collected_data.get('diagnosis', 'N/A')}"
-        f"\nEstado Emocional: {collected_data.get('emotional_state', 'N/A')}"
-        f"\nAmbiente: {collected_data.get('environment', 'N/A')}"
+        f"\nStatus de Fumante: {collected_data.get('smoking_status', 'N/A').title()}"
+        f"\nEstado Emocional (1-5): {collected_data.get('emotional_state', 'N/A')}"
+        f"\nAmbiente da Gravação: {collected_data.get('environment', 'N/A')}"
         f"\n\nÁudios de Tarefa Coletados (R2):\n{audio_list_str}"
         "\n\nPara iniciar uma nova sessão, digite /start."
     )
@@ -712,7 +728,7 @@ async def whatsapp_receive_message(request: Request):
                     # Usa asyncio.create_task para não bloquear o loop de eventos da FastAPI
                     # enquanto as funções assíncronas de processamento e envio estão rodando.
                     asyncio.create_task(
-                        handle_incoming_whatsapp_message(from_number, username, user_text, user_audio_media_id)
+                        handle_incoming_whatsapp_message(from_number, username, user_text, user_audio_media_id, message)
                     )
 
     except json.JSONDecodeError as e:
@@ -725,13 +741,13 @@ async def whatsapp_receive_message(request: Request):
     
     return Response(status_code=200) # Meta espera 200 OK para evitar reenvios
 
-async def handle_incoming_whatsapp_message(from_number: str, username: str, user_text: str | None, user_audio_media_id: str | None):
+async def handle_incoming_whatsapp_message(from_number: str, username: str, user_text: str | None, user_audio_media_id: str | None, raw_message_payload: dict):
     """
     Função auxiliar para processar a mensagem do WhatsApp e enviar a resposta.
     Rodada como uma tarefa assíncrona para não bloquear o endpoint do webhook.
     """
     try:
-        response_text, new_state = await process_whatsapp_message(from_number, username, user_text, user_audio_media_id)
+        response_text, new_state = await process_whatsapp_message(from_number, username, user_text, user_audio_media_id, raw_message_payload, )
         await send_whatsapp_response(from_number, new_state, response_text)
     except Exception as e:
         logger.error(f"Erro ao manipular mensagem do WhatsApp para {from_number}: {e}", exc_info=True)

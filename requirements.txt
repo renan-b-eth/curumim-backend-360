@@ -1,11 +1,11 @@
-python-dotenv
 fastapi
 uvicorn[standard]
+python-dotenv
+boto3
 httpx
 transformers
 torch
-soundfile # Pode ser útil para carregar/processar áudios se o Whisper tiver problemas
+soundfile
+dotenv
 google-cloud-texttospeech
-google-auth
-google-auth-oauthlib # Se for usar service account para TTS
-boto3
+google-auth-oauthlib # Se for usar credenciais de serviço do Google Cloud
